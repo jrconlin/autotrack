@@ -1,0 +1,3 @@
+#!/bin/bash
+echo Enabling the push-dev gcloud profile...
+gcloud config configurations activate jrconlin-push-dev
