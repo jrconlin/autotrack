@@ -1,2 +1,3 @@
 google-cloud-bigtable
 google-cloud-core
+google-cloud-redis

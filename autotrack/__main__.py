@@ -7,7 +7,7 @@ import time
 import uuid
 
 import google.auth
-from google.cloud import bigtable
+from google.cloud import redis as gredis
 from google.cloud.bigtable.data import (
     BigtableDataClientAsync,
     row_filters,
@@ -16,16 +16,79 @@ from google.cloud.bigtable.data import (
     ReadRowsQuery,
     TableAsync,
 )
+import redis
 
+class Counter:
+    redis: any = None
+    scripts = {}
+    log:logging.Logger = None
+
+    # A lua script for atomic updates
+
+    def __init__(self, log: logging.Logger):
+        self.redis = redis.Redis(host="localhost", port=6379, db=0)
+        self.log = log
+        self.scripts['update'] = self.redis.register_script("""
+            local key = KEYS[1]
+            local new_state = ARGV[1]
+            local old_state = ARGV[2]
+            local ttl = tonumber(ARGV[3])
+            local now = tonumber(ARGV[4])
+
+            -- increment the new state hash
+            redis.call('HINCRBY', 'state_counts', new_state, 1)
+
+            -- if old_state, decrement that.
+            if old_state and old_state ~= '' then
+                redis.call('HINCRBY', 'state_counts', old_state, -1)
+            end
+
+            -- now add the key to the timestamp cleaner hash
+            redis.call('ZADD', 'items', now, key)
+            redis.call('EXPIRE', key, ttl)
+            return true
+        """)
+        self.script['gc'] = self.redis.register_script("""
+            local now = tonumber(ARGV[1])
+            -- Collect all the items that have a score less than `now`
+            local expired_items = redis.call('ZRANGEBYSCORE', 'items', '-inf', now)
+
+            for i, key in ipairs(expired_items) do
+                local state = redis.call('HGET', key, 'state')
+                if state then
+                    redis.call('HINCRBY', 'state_counts', state, -1)
+                end
+                -- now clean things up.
+                redis.call('ZREM', 'items', key)
+                redis.call('DEL', key)
+            end
+            -- And return the count of items we removed.
+            return #expired_items
+        """)
+
+    def update(self, messageId, new, old=None, ttl=0):
+        self.session.log.debug(f"± update {messageId} {old} → {new}")
+        adj_ttl = (time.time() + ttl) * 10_000_000
+        now = time.time_ns()
+        self.script["update"](messageId, new, old, adj_ttl)
+
+    def gc(self):
+        """Remove all the exipred junk, decrement the counters."""
+        purged = self.script['gc'](time.time_ns())
+        self.session.log.debug(f"± Cleaned {purged} item(s)")
+
+    def counts(self):
+        return self.redis.hgetall('state_counts')
 
 class Session:
     project: str
     instance: str
     table_name: str
-    credentials: any
-    table: any
-    log: any
-    milestones: any
+    credentials: any = None
+    table: any = None
+    log: any = None
+    milestones: any = {}
+    counter: Counter = None
 
     def __init__(self, log):
         self.instance = os.environ.get("INSTANCE", "autopush-dev")
@@ -34,22 +97,22 @@ class Session:
         self.project = project or os.environ.get("PROJECT", "jrconlin-push-dev")
         self.log = log
         self.milestones ={
-        "rcvd": {
-            "success": 100,  # likelihood of failure
-            "next": ["stor", "trns"],
-            "delay": 0,  # ms to sit on this.
-        },
-        "stor": {"success": 90, "next": ["retr"], "delay": 100},
-        "retr": {"success": 60, "next": ["trns"], "delay": 10},
-        "trns": {"success": 90, "next": ["accp"], "delay": 100},
-        "accp": {"success": 80, "next": ["delv"], "delay": 1},
-        "delv": {
-            "success": 100,
-            "next": [],  # There are no next steps, so bail.
-            "delay": 0,
-        },
-    }
-
+            "rcvd": {
+                "success": 100,  # likelihood of failure
+                "next": ["stor", "trns"],
+                "delay": 0,  # ms to sit on this.
+            },
+            "stor": {"success": 90, "next": ["retr"], "delay": 100},
+            "retr": {"success": 60, "next": ["trns"], "delay": 10},
+            "trns": {"success": 90, "next": ["accp"], "delay": 100},
+            "accp": {"success": 80, "next": ["delv"], "delay": 1},
+            "delv": {
+                "success": 100,
+                "next": [],  # There are no next steps, so bail.
+                "delay": 0,
+            },
+        }
+        self.counter = Counter(self)
 
 
 def init_logs():
@@ -82,7 +145,7 @@ starts with a random set of bytes. (e.g. how do you specify you want
 """
 
 async def store_by_state_mid(
-    message_id: str,
+    messageId: str,
     expiry: int,
     state: str,
     previous: str,
@@ -96,46 +159,38 @@ async def store_by_state_mid(
     window queries or if we could just add a second filter looking at the
     row's timestamp.
     """
-    session.log.debug(f"Updating {message_id} -> {state}")
-    key = f"{state}#{message_id}"
+    session.log.debug(f"Updating {messageId} -> {state}")
     async with table.mutations_batcher() as batcher:
-        if previous:
-            await batcher.append(
-                RowMutationEntry(
-                    previous,
-                    [SetCell(family="state", qualifier="exit", new_value=time.time_ns())]
-                )
-            )
-        # Ideally, the "prev_state" would be the UAID+Timestamp of the prior state.
         mut_list = [
                     SetCell(family="ttl", qualifier="ttl", new_value=expiry),
-                    SetCell(family="state", qualifier="entry", new_value=time.time_ns()),
+                    SetCell(family="state", qualifier=state, new_value=time.time_ns()),
                 ]
         await batcher.append(
             RowMutationEntry (
-                key,
+                messageId,
                 mut_list,
             )
         )
-    return key
+    session.counter.update(messageId, state, previous, expiry)
+    return messageId
 
 async def store_by_mid_date_state(
-    message_id: str,
+    messageId: str,
     expiry: int,
     state: str,
     previous: str,
     session: Session,
     table:TableAsync,
 ):
-    """Store by the message_id#time#state, adding entry and exit fields.
+    """Store by the messageId#time#state, adding entry and exit fields.
 
     This has promise, but is proving to be less good for things like
     "return all items at a given state" or "return items that are between
     these times.
 
     """
-    session.log.debug(f"Updating {message_id} -> {state}")
-    key = f"{message_id}#{time.time_ns()}#{state}"
+    session.log.debug(f"Updating {messageId} -> {state}")
+    key = f"{messageId}#{time.time_ns()}#{state}"
     async with table.mutations_batcher() as batcher:
         if previous:
             await batcher.append(
@@ -160,38 +215,11 @@ async def store_by_mid_date_state(
 
 async def query_milestones(
         session: Session,
-        table:TableAsync,
 ):
-    """ Generate a query to return the count of items at various milestones
-        within given times.
-    """
-    counts = {}
-    for key in session.milestones.keys():
-        if key == 'delv':
-            continue
-        filter = row_filters.RowFilterChain(
-            filters=[
-                row_filters.RowKeyRegexFilter(f"^{key}#.*"),
-                row_filters.ConditionalRowFilter(
-                    true_filter=row_filters.BlockAllFilter(True),
-                    false_filter=row_filters.PassAllFilter(True),
-                    predicate_filter=row_filters.ColumnQualifierRegexFilter('exit')
-                )
-            ]
-        )
-
-        count =0
-        session.log.debug(f"➕ Counting {key}")
-        async for row in await table.read_rows_stream(ReadRowsQuery(row_filter=filter)):
-            # ttl = int.from_bytes(row.get_cells(family='ttl', qualifier='ttl').pop().value)
-            count += 1
-        counts[key] = count
-
-    return counts
-
+    session.counter.counts
 
 async def process_message(
-    message_id: str, expiry: int, session: Session, table
+    messageId: str, expiry: int, session: Session, table
 ):
     # get the first state out of the milestones dict.
     state_label = next(iter(session.milestones.keys()))
@@ -200,10 +228,10 @@ async def process_message(
     while True:
         state = session.milestones.get(state_label)
         if random.randint(0, 100) > state.get("success"):
-            session.log.warning(f"🚫 Faking an error for {message_id} at {state_label}")
+            session.log.warning(f"🚫 Faking an error for {messageId} at {state_label}")
             return
         previous = await store_by_state_mid(
-            message_id=message_id,
+            messageId=messageId,
             expiry=expiry,
             state=state_label,
             previous=previous,
@@ -213,11 +241,11 @@ async def process_message(
         time.sleep(0.001 * state.get("delay", 0))
         now = time.time_ns()
         if now > expiry:
-            session.log.warning(f"🪦 {message_id} has expired at {state_label}")
+            session.log.warning(f"🪦 {messageId} has expired at {state_label}")
             return
         next_states = state.get("next")
         if next_states == []:
-            session.log.info(f"🎉 {message_id} completed successfully")
+            session.log.info(f"🎉 {messageId} completed successfully")
             return
         state_label = random.choice(next_states)
 
@@ -230,9 +258,9 @@ async def fill(log: logging.Logger, count: int):
             """
             log.info("Filling table...")
             for i in range(0, count):
-                message_id = uuid.uuid4().hex
+                messageId = uuid.uuid4().hex
                 expiry = time.time_ns() + (random.randint(0, 10) * 100000000)
-                await process_message(message_id, expiry, session, table)
+                await process_message(messageId, expiry, session, table)
             """
             print(await query_milestones(session, table))
 
@@ -241,6 +269,8 @@ def main():
     log = init_logs()
     log.info("Starting up...")
     asyncio.run(fill(log, 10))
+
+    # TODO: Add a timer to run the session.counter.gc() function to clean up the counter table.
 
 
 if __name__ == "__main__":
