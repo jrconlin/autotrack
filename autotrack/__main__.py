@@ -32,7 +32,7 @@ class Counter:
             local key = KEYS[1]
             local new_state = ARGV[1]
             local old_state = ARGV[2]
-            local ttl = tonumber(ARGV[3])
+            local expiry_s = tonumber(ARGV[3])
             local now = tonumber(ARGV[4])
 
             -- increment the new state hash
@@ -45,10 +45,11 @@ class Counter:
 
             -- now add the key to the timestamp cleaner hash
             redis.call('ZADD', 'items', now, key)
-            redis.call('EXPIRE', key, ttl)
+            redis.call('EXPIRE', key, expiry_s)
             return true
         """)
-        self.script['gc'] = self.redis.register_script("""
+
+        self.scripts['gc'] = self.redis.register_script("""
             local now = tonumber(ARGV[1])
             -- Collect all the items that have a score less than `now`
             local expired_items = redis.call('ZRANGEBYSCORE', 'items', '-inf', now)
@@ -66,19 +67,29 @@ class Counter:
             return #expired_items
         """)
 
-    def update(self, messageId, new, old=None, ttl=0):
-        self.session.log.debug(f"± update {messageId} {old} → {new}")
-        adj_ttl = (time.time() + ttl) * 10_000_000
-        now = time.time_ns()
-        self.script["update"](messageId, new, old, adj_ttl)
+    def update(self, messageId, new, old=None, expiry_s=None):
+        self.log.debug(f"± update {messageId} {old} → {new}")
+        now = time.time()
+        if expiry_s is None:
+            expiry_s = now
+        # lua_script([keys], [args])
+        with self.redis.pipeline() as pipeline:
+            pipeline.hincrby('state_counts', new, 1)
+            if old is not None:
+                pipeline.hincrby('state_counts', old, -1)
+            pipeline.zadd('items', {messageId:now})
+            pipeline.expire(messageId, expiry_s)
+            pipeline.execute()
+        # self.scripts["update"]([messageId], [new, old, expiry_s, now])
 
     def gc(self):
         """Remove all the exipred junk, decrement the counters."""
-        purged = self.script['gc'](time.time_ns())
-        self.session.log.debug(f"± Cleaned {purged} item(s)")
+        purged = self.scripts['gc']([],[time.time()])
+        self.log.debug(f"± Cleaned {purged} item(s)")
+        return purged
 
-    def counts(self):
-        return self.redis.hgetall('state_counts')
+    def counts(self, keys=[]):
+        return {keys: item for keys, item in zip(keys, map( lambda x: int(x), self.redis.hmget('state_counts',keys)))}
 
 class Session:
     project: str
@@ -86,7 +97,7 @@ class Session:
     table_name: str
     credentials: any = None
     table: any = None
-    log: any = None
+    log: logging.Logger = None
     milestones: any = {}
     counter: Counter = None
 
@@ -112,7 +123,7 @@ class Session:
                 "delay": 0,
             },
         }
-        self.counter = Counter(self)
+        self.counter = Counter(self.log)
 
 
 def init_logs():
@@ -146,7 +157,7 @@ starts with a random set of bytes. (e.g. how do you specify you want
 
 async def store_by_state_mid(
     messageId: str,
-    expiry: int,
+    expiry_ns: int,
     state: str,
     previous: str,
     session: Session,
@@ -162,8 +173,8 @@ async def store_by_state_mid(
     session.log.debug(f"Updating {messageId} -> {state}")
     async with table.mutations_batcher() as batcher:
         mut_list = [
-                    SetCell(family="ttl", qualifier="ttl", new_value=expiry),
-                    SetCell(family="state", qualifier=state, new_value=time.time_ns()),
+                    SetCell(family="ttl", qualifier="ttl", new_value=int(expiry_ns)),
+                    SetCell(family="state", qualifier=state, new_value=int(time.time_ns())),
                 ]
         await batcher.append(
             RowMutationEntry (
@@ -171,12 +182,15 @@ async def store_by_state_mid(
                 mut_list,
             )
         )
-    session.counter.update(messageId, state, previous, expiry)
+    # need to convert the expiry to seconds for redis.
+    expiry_s = int(int(expiry_ns*1e-9) - time.time())
+    session.log.debug(f"expire in {expiry_s}")
+    session.counter.update(messageId, state, previous, expiry_s)
     return messageId
 
 async def store_by_mid_date_state(
     messageId: str,
-    expiry: int,
+    expiry_ns: int,
     state: str,
     previous: str,
     session: Session,
@@ -201,7 +215,7 @@ async def store_by_mid_date_state(
             )
         # Ideally, the "prev_state" would be the UAID+Timestamp of the prior state.
         mut_list = [
-                    SetCell(family="ttl", qualifier="ttl", new_value=expiry),
+                    SetCell(family="ttl", qualifier="ttl", new_value=expiry_ns),
                     SetCell(family="state", qualifier="entry", new_value=time.time_ns()),
                 ]
         await batcher.append(
@@ -216,10 +230,10 @@ async def store_by_mid_date_state(
 async def query_milestones(
         session: Session,
 ):
-    session.counter.counts
+    print(session.counter.counts(session.milestones.keys()))
 
 async def process_message(
-    messageId: str, expiry: int, session: Session, table
+    messageId: str, expiry_ns: int, session: Session, table
 ):
     # get the first state out of the milestones dict.
     state_label = next(iter(session.milestones.keys()))
@@ -232,7 +246,7 @@ async def process_message(
             return
         previous = await store_by_state_mid(
             messageId=messageId,
-            expiry=expiry,
+            expiry_ns=expiry_ns,
             state=state_label,
             previous=previous,
             session=session,
@@ -240,7 +254,7 @@ async def process_message(
         )
         time.sleep(0.001 * state.get("delay", 0))
         now = time.time_ns()
-        if now > expiry:
+        if now > expiry_ns:
             session.log.warning(f"🪦 {messageId} has expired at {state_label}")
             return
         next_states = state.get("next")
@@ -251,24 +265,37 @@ async def process_message(
 
 
 # purge with `cbt deleteallrows $TABLE`
-async def fill(log: logging.Logger, count: int):
-    session = Session(log)
+async def fill(session: Session, count: int):
     async with BigtableDataClientAsync(project=session.project) as client:
         async with client.get_table(session.instance, session.table_name) as table:
-            """
-            log.info("Filling table...")
+            session.log.info("Filling table...")
             for i in range(0, count):
                 messageId = uuid.uuid4().hex
-                expiry = time.time_ns() + (random.randint(0, 10) * 100000000)
-                await process_message(messageId, expiry, session, table)
-            """
-            print(await query_milestones(session, table))
+                # time is limited to seconds?
+                expiry_ns = time.time_ns() + (random.randint(0, 10) * 1e+9)
+                await process_message(messageId, expiry_ns, session, table)
+
+
+async def amain (log: logging.Logger):
+    session = Session(log)
+    start = time.time()
+    print(session.counter.gc())
+    log.debug(f"GC time {time.time() - start}")
+    await fill(session, 10)
+    start = time.time()
+    print(session.counter.gc())
+    log.debug(f"GC time {time.time() - start}")
+    await query_milestones(session)
+    for i in range(1,100):
+        time.sleep(5)
+        print(session.counter.gc())
+        await query_milestones(session)
 
 
 def main():
     log = init_logs()
     log.info("Starting up...")
-    asyncio.run(fill(log, 10))
+    asyncio.run(amain(log))
 
     # TODO: Add a timer to run the session.counter.gc() function to clean up the counter table.
 

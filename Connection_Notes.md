@@ -4,7 +4,7 @@ If you haven't already, download `gcloud`.
 
 Create a local project profile. The $PROJECT name does not need to match the
 GCP project, but it will probably help you keep things straight.
-`gcloud config configurations create $PROJECT`
+`gcloud config configurations create $GOOGLE_CLOUD_PROJECT`
 
 This creates a specific local project that will contain various settings for
 gcloud. It's not strictly needed, but if you work on multiple projects like
@@ -16,7 +16,7 @@ gcloud auth login
 # Now log in using the application default (for when you run python stuff.)
 gcloud auth application-default login
 # set the default console project for this profile (This *is* the GCP project)
-gcloud config set project $PROJECT
+gcloud config set project $GOOGLE_CLOUD_PROJECT
 gcloud config set account $ACCOUNT_ID
 ```
 
