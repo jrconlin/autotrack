@@ -213,7 +213,7 @@ async def store_by_state_mid(
     state: str,
     previous: str,
     session: Session,
-    table: TableAsync,
+    table: any,
 ):
     """This approach will at least allow us to gather up the messages that
     are in given milestone states. We can filter them by looking at ones
@@ -227,17 +227,18 @@ async def store_by_state_mid(
     ):
         raise f"Invalid state {state} {previous}"
     session.log.debug(f"Updating {messageId} -> {state}")
-    async with table.mutations_batcher() as batcher:
-        mut_list = [
-            SetCell(family="ttl", qualifier="ttl", new_value=int(expiry_ns)),
-            SetCell(family="state", qualifier=state, new_value=int(time.time_ns())),
-        ]
-        await batcher.append(
-            RowMutationEntry(
-                messageId,
-                mut_list,
+    if table is not None:
+        async with table.mutations_batcher() as batcher:
+            mut_list = [
+                SetCell(family="ttl", qualifier="ttl", new_value=int(expiry_ns)),
+                SetCell(family="state", qualifier=state, new_value=int(time.time_ns())),
+            ]
+            await batcher.append(
+                RowMutationEntry(
+                    messageId,
+                    mut_list,
+                )
             )
-        )
     # need to convert the expiry to seconds for redis.
     expiry_s = int(int(expiry_ns * 1e-9) - time.time())
     session.log.debug(f"expire in {expiry_s}")
@@ -251,7 +252,7 @@ async def store_by_mid_date_state(
     state: str,
     previous: str,
     session: Session,
-    table: TableAsync,
+    table: any,
 ):
     """Store by the messageId#time#state, adding entry and exit fields.
 
@@ -262,29 +263,30 @@ async def store_by_mid_date_state(
     """
     session.log.debug(f"Updating {messageId} -> {state}")
     key = f"{messageId}#{time.time_ns()}#{state}"
-    async with table.mutations_batcher() as batcher:
-        if previous:
+    if table is not None:
+        async with table.mutations_batcher() as batcher:
+            if previous:
+                await batcher.append(
+                    RowMutationEntry(
+                        previous,
+                        [
+                            SetCell(
+                                family="state", qualifier="exit", new_value=time.time_ns()
+                            )
+                        ],
+                    )
+                )
+            # Ideally, the "prev_state" would be the UAID+Timestamp of the prior state.
+            mut_list = [
+                SetCell(family="ttl", qualifier="ttl", new_value=expiry_ns),
+                SetCell(family="state", qualifier="entry", new_value=time.time_ns()),
+            ]
             await batcher.append(
                 RowMutationEntry(
-                    previous,
-                    [
-                        SetCell(
-                            family="state", qualifier="exit", new_value=time.time_ns()
-                        )
-                    ],
+                    key,
+                    mut_list,
                 )
             )
-        # Ideally, the "prev_state" would be the UAID+Timestamp of the prior state.
-        mut_list = [
-            SetCell(family="ttl", qualifier="ttl", new_value=expiry_ns),
-            SetCell(family="state", qualifier="entry", new_value=time.time_ns()),
-        ]
-        await batcher.append(
-            RowMutationEntry(
-                key,
-                mut_list,
-            )
-        )
     return key
 
 
@@ -325,7 +327,7 @@ async def process_message(messageId: str, expiry_ns: int, session: Session, tabl
 
 
 # purge with `cbt deleteallrows $TABLE`
-async def fill(session: Session, count: int):
+async def fill_with_bt(session: Session, count: int):
     async with BigtableDataClientAsync(project=session.project) as client:
         async with client.get_table(session.instance, session.table_name) as table:
             session.log.info("Filling table...")
@@ -335,30 +337,38 @@ async def fill(session: Session, count: int):
                 expiry_ns = time.time_ns() + (random.randint(0, 10) * 1e9)
                 await process_message(messageId, expiry_ns, session, table)
 
+async def fill_wo_bt(session: Session, count: int):
+    """If we're just testing the redis stuff, we don't need to
+    fill up bigtable with crap."""
+    session.log.info("Filling table...")
+    for i in range(0, count):
+        messageId = uuid.uuid4().hex
+        # time is limited to seconds?
+        expiry_ns = time.time_ns() + (random.randint(0, 10) * 1e9)
+        await process_message(messageId, expiry_ns, session, None)
 
-async def amain(log: logging.Logger):
+async def amain(log: logging.Logger, fillers: int = 1, count: int=10):
     session = Session(log)
     start = time.time()
     session.counter.gc()
     log.debug(f"GC time {time.time() - start}")
-    await fill(session, 10)
-    start = time.time()
+    for i in range(1, fillers):
+        await fill_wo_bt(session, count)
     session.counter.gc()
-    log.debug(f"GC time {time.time() - start}")
     for i in range(1, 10):
-        session.counter.gc()
         counters = await query_milestones(session)
         print(counters)
         if set(counters.values()) == {0}:
             print("Done")
             return
         time.sleep(5)
+        session.counter.gc()
 
 
 def main():
     log = init_logs()
     log.info("Starting up...")
-    asyncio.run(amain(log))
+    asyncio.run(amain(log, 10, 1000))
 
     # TODO: Add a timer to run the session.counter.gc() function to clean up the counter table.
 
