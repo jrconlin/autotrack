@@ -1,4 +1,5 @@
 import asyncio
+from asyncio import TaskGroup
 
 import os
 import logging
@@ -17,6 +18,8 @@ from google.cloud.bigtable.data import (
     TableAsync,
 )
 import redis
+
+RELIABILITY_FAMILY = "reliability"
 
 
 class Counter:
@@ -94,15 +97,17 @@ class Counter:
         """
         )
 
-    def update(self, messageId, new, old=None, expiry_s=None):
+    async def update(self, messageId, new, old=None, expiry_s=None):
         self.log.debug(f"± update {messageId} {old} → {new}")
         now = int(time.time())
         if expiry_s is None:
             expiry_s = now
         with self.redis.pipeline() as pipeline:
             pipeline.hincrby("state_counts", new, 1)
+            pipeline.ts().incrby(f"state_counts:{new}", 1)
             if old is not None:
                 pipeline.hincrby("state_counts", old, -1)
+                pipeline.ts().incrby(f"state_counts:{old}", -1)
                 # remove any old "state" items
                 pipeline.zrem("items", f"{old}#{messageId}")
             # add the item and score into the `items` key.
@@ -115,9 +120,10 @@ class Counter:
         self.scripts["update"]([messageId], [new, old, expiry_s, now])
         """
 
-    def gc(self):
-        """Remove all the exipred junk, decrement the counters."""
+    async def gc(self):
+        """Remove all the expired junk, decrement the counters."""
         # TODO: add distributed lock with timer?
+        logging.info("🗑 ============ Collecting garbage")
         purged = self.redis.zrange("items", -1, int(time.time()), byscore=True)
         with self.redis.pipeline() as pipeline:
             for key in purged:
@@ -125,6 +131,7 @@ class Counter:
                 state = parts[0]
                 self.log.debug(f"decr {state.decode()}")
                 pipeline.hincrby("state_counts", state, -1)
+                pipeline.ts().incrby(f"state_counts:{state}", -1)
                 pipeline.zrem("items", key)
             pipeline.execute()
         return purged
@@ -135,7 +142,7 @@ class Counter:
         return purged
         """
 
-    def counts(self):
+    async def counts(self):
         result = {}
         for item in self.redis.hgetall("state_counts").items():
             result[item[0].decode()] = int(item[1])
@@ -153,22 +160,36 @@ class Session:
     counter: Counter = None
 
     def __init__(self, log):
-        self.instance = os.environ.get("INSTANCE", "autopush-dev")
-        self.table_name = os.environ.get("TABLE", "tracking")
         self.credentials, project = google.auth.default()
-        self.project = project or os.environ.get("PROJECT", "jrconlin-push-dev")
+        self.project = project or os.environ.get("PROJECT", "test")
+        self.instance = os.environ.get("INSTANCE", "test")
+        self.table_name = os.environ.get("TABLE", "autopush")
         self.log = log
         self.milestones = {
-            "rcvd": {
+            "received": {
                 "success": 100,  # likelihood of failure
-                "next": ["stor", "trns"],
+                "next": ["stored", "transmitted_webpush", "transmitted"],
                 "delay": 0,  # ms to sit on this.
             },
-            "stor": {"success": 90, "next": ["retr"], "delay": 100},
-            "retr": {"success": 60, "next": ["trns"], "delay": 10},
-            "trns": {"success": 90, "next": ["accp"], "delay": 100},
-            "accp": {"success": 80, "next": ["delv"], "delay": 1},
-            "delv": {
+            "stored": {"success": 90, "next": ["retrieved"], "delay": 100},
+            "retrieved": {
+                "success": 60,
+                "next": ["transmitted_webpush", "transmitted"],
+                "delay": 10,
+            },
+            "transmitted_webpush": {
+                "success": 95,
+                "next": ["accepted_webpush"],
+                "delay": 0,
+            },
+            "accepted_webpush": {
+                "success": 95,
+                "next": ["transmitted"],
+                "delay": 0,
+            },
+            "transmitted": {"success": 90, "next": ["accepted"], "delay": 100},
+            "accepted": {"success": 80, "next": ["delivered"], "delay": 1},
+            "delivered": {
                 "success": 100,
                 "next": [],  # There are no next steps, so bail.
                 "delay": 0,
@@ -230,8 +251,11 @@ async def store_by_state_mid(
     if table is not None:
         async with table.mutations_batcher() as batcher:
             mut_list = [
-                SetCell(family="ttl", qualifier="ttl", new_value=int(expiry_ns)),
-                SetCell(family="state", qualifier=state, new_value=int(time.time_ns())),
+                SetCell(
+                    family=RELIABILITY_FAMILY,
+                    qualifier=state,
+                    new_value=int(time.time_ns()),
+                ),
             ]
             await batcher.append(
                 RowMutationEntry(
@@ -242,7 +266,7 @@ async def store_by_state_mid(
     # need to convert the expiry to seconds for redis.
     expiry_s = int(int(expiry_ns * 1e-9) - time.time())
     session.log.debug(f"expire in {expiry_s}")
-    session.counter.update(messageId, state, previous, expiry_s)
+    await session.counter.update(messageId, state, previous, expiry_s)
     return state
 
 
@@ -271,7 +295,9 @@ async def store_by_mid_date_state(
                         previous,
                         [
                             SetCell(
-                                family="state", qualifier="exit", new_value=time.time_ns()
+                                family="state",
+                                qualifier="exit",
+                                new_value=time.time_ns(),
                             )
                         ],
                     )
@@ -293,7 +319,7 @@ async def store_by_mid_date_state(
 async def query_milestones(
     session: Session,
 ):
-    return session.counter.counts()
+    return await session.counter.counts()
 
 
 async def process_message(messageId: str, expiry_ns: int, session: Session, table):
@@ -314,7 +340,7 @@ async def process_message(messageId: str, expiry_ns: int, session: Session, tabl
             session=session,
             table=table,
         )
-        time.sleep(0.001 * state.get("delay", 0))
+        await asyncio.sleep(0.001 * state.get("delay", 0))
         now = time.time_ns()
         if now > expiry_ns:
             session.log.warning(f"🪦 {messageId} has expired at {state_label}")
@@ -337,6 +363,7 @@ async def fill_with_bt(session: Session, count: int):
                 expiry_ns = time.time_ns() + (random.randint(0, 10) * 1e9)
                 await process_message(messageId, expiry_ns, session, table)
 
+
 async def fill_wo_bt(session: Session, count: int):
     """If we're just testing the redis stuff, we don't need to
     fill up bigtable with crap."""
@@ -347,22 +374,35 @@ async def fill_wo_bt(session: Session, count: int):
         expiry_ns = time.time_ns() + (random.randint(0, 10) * 1e9)
         await process_message(messageId, expiry_ns, session, None)
 
-async def amain(log: logging.Logger, fillers: int = 1, count: int=10):
-    session = Session(log)
-    start = time.time()
-    session.counter.gc()
-    log.debug(f"GC time {time.time() - start}")
+
+async def msg_loop(
+    session: Session, log: logging.Logger, fillers: int = 1, count: int = 10
+):
     for i in range(1, fillers):
-        await fill_wo_bt(session, count)
-    session.counter.gc()
+        await fill_with_bt(session, count)
     for i in range(1, 10):
         counters = await query_milestones(session)
         print(counters)
         if set(counters.values()) == {0}:
             print("Done")
             return
-        time.sleep(5)
-        session.counter.gc()
+        await asyncio.sleep(5)
+
+
+async def janitor(session: Session, log: logging.Logger):
+    while True:
+        await asyncio.sleep(10)
+        start = time.time()
+        await session.counter.gc()
+        log.debug(f"🗑 ===== GC time {time.time() - start}")
+
+
+async def amain(log: logging.Logger, fillers: int = 1, count: int = 10):
+    session = Session(log)
+    await session.counter.gc()
+    r = await asyncio.gather(
+        msg_loop(session, log, fillers, count), janitor(session, log)
+    )
 
 
 def main():
